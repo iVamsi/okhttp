@@ -34,10 +34,7 @@ data class DnsMessage(
     get() = (flags and 0b0000_0000_0000_1111)
 
   companion object {
-    fun query(
-      hostname: String,
-      type: Int,
-    ): DnsMessage {
+    fun query(question: Question): DnsMessage {
       //     QR = 0 (Query)
       //     RD = 1 (Recursion Desired)
       // OPCODE = 0 (standard query)
@@ -46,24 +43,39 @@ data class DnsMessage(
       return DnsMessage(
         id = 0,
         flags = flags,
-        questions =
-          listOf(
-            Question(
-              name = hostname,
-              type = type,
-            ),
-          ),
+        questions = listOf(question),
+      )
+    }
+
+    fun response(
+      id: Short = 0,
+      questions: List<Question>,
+      answers: List<ResourceRecord>,
+    ): DnsMessage {
+      //     QR = 1 (Response)
+      // OPCODE = 0 (standard query)
+      //  RCODE = 0 (success)
+      //           QR OPCODE AA TC RD RA   Z RCODE
+      val flags = 0b1___0000__0__0__0__0_000__0000
+
+      return DnsMessage(
+        id = id,
+        flags = flags,
+        questions = questions,
+        answers = answers,
       )
     }
   }
 }
 
+@OkHttpInternalApi
 data class Question(
   val name: String,
   val type: Int,
   val `class`: Int = CLASS_IN,
 )
 
+@OkHttpInternalApi
 sealed interface ResourceRecord {
   val name: String
   val timeToLive: Int

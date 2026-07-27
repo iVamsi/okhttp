@@ -18,11 +18,14 @@ package okhttp3.dnsoverhttps
 import java.net.InetAddress
 import java.net.UnknownHostException
 import okhttp3.Dns
+import okhttp3.DnsCache
 import okhttp3.HttpUrl
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.dnsoverhttps.internal.DnsOverHttpsCall
+import okhttp3.dnsoverhttps.internal.DnsOverHttpsQuery
+import okhttp3.internal.concurrent.TaskRunner
+import okhttp3.internal.dns.StateMachineDnsCall
 import okhttp3.internal.dns.execute
 import okhttp3.internal.publicsuffix.PublicSuffixDatabase
 
@@ -37,52 +40,45 @@ import okhttp3.internal.publicsuffix.PublicSuffixDatabase
  * [doh_spec]: https://tools.ietf.org/html/draft-ietf-doh-dns-over-https-13
  */
 class DnsOverHttps internal constructor(
+  private val taskRunner: TaskRunner,
   @get:JvmName("client") val client: OkHttpClient,
   @get:JvmName("url") val url: HttpUrl,
+  @get:JvmName("cache") val cache: DnsCache,
   @get:JvmName("includeIPv6") val includeIPv6: Boolean,
   @get:JvmName("includeServiceMetadata") val includeServiceMetadata: Boolean,
   @get:JvmName("post") val post: Boolean,
   @get:JvmName("resolvePrivateAddresses") val resolvePrivateAddresses: Boolean,
   @get:JvmName("resolvePublicAddresses") val resolvePublicAddresses: Boolean,
 ) : Dns {
-  override fun newCall(request: Dns.Request): Dns.Call {
-    val canceledException = validate(request.hostname)
-    return DnsOverHttpsCall(
+  private val queryFactory =
+    cache.`-delegate`.wrap(
+      DnsOverHttpsQuery.Factory(
+        taskRunner = taskRunner,
+        resolvePrivateAddresses = resolvePrivateAddresses,
+        resolvePublicAddresses = resolvePublicAddresses,
+        client = client,
+        dnsUrl = url,
+        post = post,
+      ),
+    )
+
+  override fun newCall(request: Dns.Request): Dns.Call =
+    StateMachineDnsCall(
+      taskRunner = taskRunner,
       request = request,
-      client = client,
-      dnsUrl = url,
-      post = post,
+      queryFactory = queryFactory,
       includeIPv6 = includeIPv6,
       includeServiceMetadata = includeServiceMetadata,
-      canceledException = canceledException,
     )
-  }
-
-  /**
-   * Returns an exception if [hostname] should not be resolved.
-   *
-   * We **return** this exception rather than throwing it because in the [Dns.Callback] case we want
-   * `onFailure()` to be called on a dispatcher thread and not synchronously.
-   */
-  private fun validate(hostname: String): UnknownHostException? {
-    // Don't load the public suffix list unless necessary.
-    if (resolvePrivateAddresses && resolvePublicAddresses) return null
-
-    val privateHost = isPrivateHost(hostname)
-
-    return when {
-      privateHost && !resolvePrivateAddresses -> UnknownHostException("private hosts not resolved")
-      !privateHost && !resolvePublicAddresses -> UnknownHostException("public hosts not resolved")
-      else -> null
-    }
-  }
 
   @Throws(UnknownHostException::class)
   override fun lookup(hostname: String): List<InetAddress> {
     val withoutServiceMetadata =
       DnsOverHttps(
+        taskRunner = taskRunner,
         client = client,
         url = url,
+        cache = cache,
         includeIPv6 = includeIPv6,
         includeServiceMetadata = false,
         post = post,
@@ -97,8 +93,10 @@ class DnsOverHttps internal constructor(
   }
 
   class Builder {
+    internal val taskRunner = TaskRunner.INSTANCE
     internal var client: OkHttpClient? = null
     internal var url: HttpUrl? = null
+    internal var cache: DnsCache = DnsCache()
     internal var includeIPv6 = true
     internal var includeServiceMetadata = true
     internal var post = false
@@ -110,13 +108,15 @@ class DnsOverHttps internal constructor(
     fun build(): DnsOverHttps {
       val client = this.client ?: throw NullPointerException("client not set")
       return DnsOverHttps(
-        client.newBuilder().dns(buildBootstrapClient(this)).build(),
-        checkNotNull(url) { "url not set" },
-        includeIPv6,
-        includeServiceMetadata,
-        post,
-        resolvePrivateAddresses,
-        resolvePublicAddresses,
+        taskRunner = taskRunner,
+        client = client.newBuilder().dns(buildBootstrapClient(this)).build(),
+        url = checkNotNull(url) { "url not set" },
+        cache = cache,
+        includeIPv6 = includeIPv6,
+        includeServiceMetadata = includeServiceMetadata,
+        post = post,
+        resolvePrivateAddresses = resolvePrivateAddresses,
+        resolvePublicAddresses = resolvePublicAddresses,
       )
     }
 
@@ -128,6 +128,11 @@ class DnsOverHttps internal constructor(
     fun url(url: HttpUrl) =
       apply {
         this.url = url
+      }
+
+    fun cache(cache: DnsCache) =
+      apply {
+        this.cache = cache
       }
 
     /**

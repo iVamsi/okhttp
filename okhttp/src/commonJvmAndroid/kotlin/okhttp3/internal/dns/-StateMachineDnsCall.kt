@@ -13,34 +13,31 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package okhttp3.dnsoverhttps.internal
+@file:OptIn(OkHttpInternalApi::class)
+@file:Suppress("ktlint:standard:filename")
+
+package okhttp3.internal.dns
 
 import java.io.IOException
 import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Dns
 import okhttp3.Protocol
-import okhttp3.internal.dns.DnsMessage
-import okhttp3.internal.dns.RESPONSE_CODE_SERVER_FAILURE
-import okhttp3.internal.dns.RESPONSE_CODE_SUCCESS
-import okhttp3.internal.dns.ResourceRecord
-import okhttp3.internal.dns.TYPE_A
-import okhttp3.internal.dns.TYPE_AAAA
-import okhttp3.internal.dns.TYPE_HTTPS
+import okhttp3.internal.OkHttpInternalApi
+import okhttp3.internal.concurrent.TaskRunner
 
 /**
- * State machine for DNS calls. This is intended for use with any transport for the queries, such
- * as UDP or DNS over HTTPS.
+ * An application-layer [Dns.Call] that performs multiple transport-layer [DnsQuery]s in parallel.
+ * This delegates to a query factory for the transport, like UDP or DNS over HTTPS.
  *
  * Concurrency
  * -----------
  *
  * A few things conspire to make concurrency tricky:
  *
- *  * Each DNS record type is queried in parallel; [onQueryResponse] and [onQueryFailure] may be
- *    called concurrently.
- *  * Calls to [okhttp3.Dns.Callback] must be serialized.
- *  * We don't want to use locks to guard access to [okhttp3.Dns.Callback] functions.
+ *  * Each transport-layer [DnsQuery.Callback]s are executed in parallel.
+ *  * Application layer [Dns.Callback]s must be serialized.
+ *  * We don't want to use locks to guard access to [Dns.Callback] functions.
  *
  * Each time we receive data for the callback (in the form of records or an exception), we either
  * immediately call the callback with that data (on a dispatcher thread), or queue it for the thread
@@ -55,33 +52,28 @@ import okhttp3.internal.dns.TYPE_HTTPS
  * If a thread is intending to call the callback, it sets [State.Running.lockHeld] to true while
  * that call is executing.
  */
-internal class DnsCallStateMachine<Q>(
-  private val transport: Transport<Q>,
-  private val call: Dns.Call,
-  private val canceledException: IOException?,
+@OkHttpInternalApi
+class StateMachineDnsCall(
+  private val taskRunner: TaskRunner,
+  override val request: Dns.Request,
+  private val queryFactory: DnsQuery.Factory,
   private val includeIPv6: Boolean,
   private val includeServiceMetadata: Boolean,
-) {
-  private val state = AtomicReference<State<Q>>(State.Idle())
+) : Dns.Call {
+  private val state = AtomicReference<State>(State.Idle())
 
-  val canceled: Boolean
-    get() = state.get().canceled
+  override fun isCanceled() = state.get().canceled
 
-  fun start(callback: Dns.Callback) {
-    val queryMessages =
+  override fun enqueue(callback: Dns.Callback) {
+    val questions =
       buildList {
         if (includeServiceMetadata) {
-          add(DnsMessage.query(call.request.hostname, TYPE_HTTPS))
+          add(Question(request.hostname, TYPE_HTTPS))
         }
         if (includeIPv6) {
-          add(DnsMessage.query(call.request.hostname, TYPE_AAAA))
+          add(Question(request.hostname, TYPE_AAAA))
         }
-        add(DnsMessage.query(call.request.hostname, TYPE_A))
-      }
-
-    val queries =
-      queryMessages.map { dnsMessage ->
-        transport.newQuery(dnsMessage)
+        add(Question(request.hostname, TYPE_A))
       }
 
     while (true) {
@@ -89,9 +81,27 @@ internal class DnsCallStateMachine<Q>(
         state.get() as? State.Idle
           ?: error("already enqueued")
 
+      // If it's canceled before it is enqueued, jump straight to Complete.
+      if (previous.canceled) {
+        val next = State.Complete(canceled = true)
+
+        if (!state.compareAndSet(previous, next)) continue // Lost a race, retry.
+
+        taskRunner.newQueue().execute("${request.hostname} dns") {
+          callback.onFailure(this, IOException("canceled"))
+        }
+
+        return
+      }
+
+      val queries =
+        questions.map { question ->
+          queryFactory.newQuery(question)
+        }
+
       val next =
-        State.Running<Q>(
-          canceled = previous.canceled,
+        State.Running(
+          canceled = false,
           callback = callback,
           runningQueries = queries,
         )
@@ -99,17 +109,31 @@ internal class DnsCallStateMachine<Q>(
       if (!state.compareAndSet(previous, next)) continue // Lost a race, retry.
 
       for (query in queries) {
-        if (previous.canceled || canceledException != null) {
-          transport.cancel(query)
-        }
-        transport.enqueue(query)
+        query.enqueue(
+          callback =
+            object : DnsQuery.Callback {
+              override fun onResponse(dnsResponse: DnsMessage) {
+                updateStateAndCallCallbacks(
+                  completedQuery = query,
+                  dnsResponse = dnsResponse,
+                )
+              }
+
+              override fun onFailure(e: IOException) {
+                updateStateAndCallCallbacks(
+                  completedQuery = query,
+                  newException = e,
+                )
+              }
+            },
+        )
       }
 
       return
     }
   }
 
-  fun cancel() {
+  override fun cancel() {
     while (true) {
       val previous = state.get()
       val next = previous.cancel()
@@ -117,25 +141,15 @@ internal class DnsCallStateMachine<Q>(
 
       if (previous is State.Running) {
         for (query in previous.runningQueries) {
-          transport.cancel(query)
+          query.cancel()
         }
       }
       return
     }
   }
 
-  fun onQueryFailure(
-    query: Q,
-    e: IOException,
-  ) {
-    updateStateAndCallCallbacks(
-      completedQuery = query,
-      newException = e,
-    )
-  }
-
-  fun onQueryResponse(
-    query: Q,
+  private fun updateStateAndCallCallbacks(
+    completedQuery: DnsQuery,
     dnsResponse: DnsMessage,
   ) {
     val resourceRecords =
@@ -147,7 +161,7 @@ internal class DnsCallStateMachine<Q>(
         }
       } catch (e: IOException) {
         return updateStateAndCallCallbacks(
-          completedQuery = query,
+          completedQuery = completedQuery,
           newException = e,
         )
       }
@@ -157,7 +171,7 @@ internal class DnsCallStateMachine<Q>(
         when (resourceRecord) {
           is ResourceRecord.Https -> {
             Dns.Record.ServiceMetadata(
-              hostname = resourceRecord.targetName.takeIf { it != "" } ?: call.request.hostname,
+              hostname = resourceRecord.targetName.takeIf { it != "" } ?: request.hostname,
               alpnIds =
                 resourceRecord.alpnIds?.mapNotNull { alpnId ->
                   try {
@@ -174,7 +188,7 @@ internal class DnsCallStateMachine<Q>(
 
           is ResourceRecord.IpAddress -> {
             Dns.Record.IpAddress(
-              hostname = call.request.hostname,
+              hostname = request.hostname,
               address = resourceRecord.address,
             )
           }
@@ -182,13 +196,13 @@ internal class DnsCallStateMachine<Q>(
       }
 
     updateStateAndCallCallbacks(
-      completedQuery = query,
+      completedQuery = completedQuery,
       newRecords = dnsRecords,
     )
   }
 
   private tailrec fun updateStateAndCallCallbacks(
-    completedQuery: Q? = null,
+    completedQuery: DnsQuery? = null,
     newRecords: List<Dns.Record> = listOf(),
     newException: IOException? = null,
     lockHeldByThisThread: Boolean = false,
@@ -206,7 +220,6 @@ internal class DnsCallStateMachine<Q>(
 
       val allExceptions =
         when {
-          canceledException != null -> listOf(canceledException)
           newException != null -> previous.pendingExceptions + newException
           else -> previous.pendingExceptions
         }
@@ -226,7 +239,7 @@ internal class DnsCallStateMachine<Q>(
       // In such cases, hand off any new work to that other thread and be done.
       if ((!last && allRecords.isEmpty()) || lockHeldByAnotherThread) {
         val next =
-          State.Running<Q>(
+          State.Running(
             canceled = previous.canceled,
             callback = previous.callback,
             runningQueries = newRunningQueries,
@@ -261,7 +274,7 @@ internal class DnsCallStateMachine<Q>(
       val lastAndNoExceptions = last && allExceptions.isEmpty()
       if (allRecords.isNotEmpty() || lastAndNoExceptions) {
         previous.callback.onRecords(
-          call = call,
+          call = this,
           last = lastAndNoExceptions,
           records = allRecords,
         )
@@ -269,7 +282,7 @@ internal class DnsCallStateMachine<Q>(
 
       if (last && allExceptions.isNotEmpty()) {
         previous.callback.onFailure(
-          call = call,
+          call = this,
           exceptions = allExceptions,
         )
       }
@@ -282,23 +295,23 @@ internal class DnsCallStateMachine<Q>(
     }
   }
 
-  private sealed interface State<out Q> {
+  private sealed interface State {
     val canceled: Boolean
 
     class Idle(
       override val canceled: Boolean = false,
-    ) : State<Nothing> {
+    ) : State {
       override fun cancel() = Idle(canceled = true)
     }
 
-    class Running<Q>(
+    class Running(
       override val canceled: Boolean,
       val callback: Dns.Callback,
       val lockHeld: Boolean = false,
-      val runningQueries: List<Q>,
+      val runningQueries: List<DnsQuery>,
       val pendingRecords: List<Dns.Record> = listOf(),
       val pendingExceptions: List<IOException> = listOf(),
-    ) : State<Q> {
+    ) : State {
       init {
         check(pendingRecords.isEmpty() || lockHeld)
       }
@@ -316,19 +329,11 @@ internal class DnsCallStateMachine<Q>(
 
     class Complete(
       override val canceled: Boolean,
-    ) : State<Nothing> {
+    ) : State {
       override fun cancel() = Idle(canceled = true)
     }
 
-    fun cancel(): State<Q>
-  }
-
-  interface Transport<Q> {
-    fun newQuery(dnsMessage: DnsMessage): Q
-
-    fun enqueue(query: Q)
-
-    fun cancel(query: Q)
+    fun cancel(): State
   }
 }
 
