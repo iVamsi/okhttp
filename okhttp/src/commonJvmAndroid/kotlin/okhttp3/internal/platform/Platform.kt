@@ -23,9 +23,12 @@ import java.security.GeneralSecurityException
 import java.security.KeyStore
 import java.util.logging.Level
 import java.util.logging.Logger
+import javax.net.ServerSocketFactory
+import javax.net.SocketFactory
 import javax.net.ssl.ExtendedSSLSession
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManager
@@ -34,6 +37,7 @@ import javax.net.ssl.X509TrustManager
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.internal.dns.EchRetryConfig
 import okhttp3.internal.publicsuffix.PublicSuffixDatabase
 import okhttp3.internal.readFieldOrNull
 import okhttp3.internal.tls.BasicCertificateChainCleaner
@@ -72,8 +76,15 @@ import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement
  * Supported on Android 6.0+ via `NetworkSecurityPolicy`.
  */
 open class Platform {
+  open val socketFactory: SocketFactory
+    get() = SocketFactory.getDefault()
+
+  open val serverSocketFactory: ServerSocketFactory
+    get() = ServerSocketFactory.getDefault()
+
   /** Prefix used on custom headers. */
-  fun getPrefix() = "OkHttp"
+  val prefix: String
+    get() = "OkHttp"
 
   open fun newSSLContext(): SSLContext = SSLContext.getInstance("TLS")
 
@@ -121,6 +132,9 @@ open class Platform {
     echConfigList: ByteString?,
   ) {
   }
+
+  /** Returns the ECH retry configuration carried by [exception]. */
+  internal open fun getEchRetryConfig(exception: SSLException): EchRetryConfig? = null
 
   /** Called after the TLS handshake to release resources allocated by [configureTlsExtensions]. */
   open fun afterHandshake(sslSocket: SSLSocket) {
