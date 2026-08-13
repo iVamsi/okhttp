@@ -23,6 +23,8 @@ import okio.Buffer
 import okio.BufferedSink
 import okio.ByteString
 import okio.ByteString.Companion.encodeUtf8
+import okio.ForwardingSink
+import okio.buffer
 
 /**
  * An [RFC 2387][rfc_2387]-compliant request body.
@@ -160,7 +162,12 @@ class MultipartBody internal constructor(
       if (countBytes) {
         byteCount += contentLength
       } else {
-        body.writeTo(sink)
+        object : ForwardingSink(sink) {
+          override fun close() {
+            // GzipSink.close() writes the gzip footer, then closes whatever it wraps.
+            // Swallow that close so we can write the trailing CRLF and later parts.
+          }
+        }.buffer().use(body::writeTo)
       }
 
       sink.write(CRLF)

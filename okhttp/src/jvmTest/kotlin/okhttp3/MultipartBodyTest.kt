@@ -260,6 +260,52 @@ class MultipartBodyTest {
   }
 
   @Test
+  fun partThatClosesTheSink() {
+    class ClosingBody(
+      private val body: String,
+    ) : RequestBody() {
+      override fun contentType(): MediaType? = null
+
+      @Throws(IOException::class)
+      override fun writeTo(sink: BufferedSink) {
+        sink.writeUtf8(body)
+        sink.close()
+      }
+    }
+
+    val expected =
+      """
+      |--123
+      |
+      |hello
+      |--123
+      |
+      |world
+      |--123--
+      |
+      """.trimMargin().replace("\n", "\r\n")
+    val body =
+      MultipartBody
+        .Builder("123")
+        .addPart(ClosingBody("hello"))
+        .addPart("world".toRequestBody(null))
+        .build()
+    assertThat(body.boundary).isEqualTo("123")
+    assertThat(body.type).isEqualTo(MultipartBody.MIXED)
+    assertThat(body.contentType().toString())
+      .isEqualTo("multipart/mixed; boundary=123")
+    assertThat(body.parts.size).isEqualTo(2)
+    assertThat(body.contentLength()).isEqualTo(-1)
+    val buffer = Buffer()
+    // Don't write to Buffer directly: Buffer.close() is a no-op. Wrap it so close()
+    // actually closes the sink, like a real HTTP write.
+    val sink = object : ForwardingSink(buffer) {}.buffer()
+    body.writeTo(sink)
+    sink.close()
+    assertThat(buffer.readUtf8()).isEqualTo(expected)
+  }
+
+  @Test
   fun gzippedParts() {
     val body =
       MultipartBody

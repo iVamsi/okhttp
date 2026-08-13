@@ -17,7 +17,6 @@ package okhttp3.internal.http
 
 import okhttp3.RequestBody
 import okio.BufferedSink
-import okio.ForwardingSink
 import okio.GzipSink
 import okio.buffer
 
@@ -30,14 +29,7 @@ internal class GzipRequestBody(
   override fun contentLength() = -1L
 
   override fun writeTo(sink: BufferedSink) {
-    GzipSink(
-      object : ForwardingSink(sink) {
-        override fun close() {
-          // GzipSink.close() writes the gzip footer, then closes whatever it wraps.
-          // Swallow that close so the caller's sink stays open (MultipartBody writes more).
-        }
-      },
-    ).buffer().use(delegate::writeTo)
+    GzipSink(sink).buffer().use(delegate::writeTo)
   }
 
   override fun isOneShot() = delegate.isOneShot()
