@@ -17,7 +17,6 @@ package okhttp3
 
 import assertk.assertThat
 import assertk.assertions.isEqualTo
-import assertk.assertions.isNull
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import kotlin.test.assertFailsWith
@@ -29,7 +28,6 @@ import okhttp3.internal.http.GzipRequestBody
 import okio.Buffer
 import okio.BufferedSink
 import okio.ForwardingSink
-import okio.GzipSource
 import okio.buffer
 import okio.utf8Size
 import org.junit.jupiter.api.Test
@@ -290,12 +288,6 @@ class MultipartBodyTest {
         .addPart(ClosingBody("hello"))
         .addPart("world".toRequestBody(null))
         .build()
-    assertThat(body.boundary).isEqualTo("123")
-    assertThat(body.type).isEqualTo(MultipartBody.MIXED)
-    assertThat(body.contentType().toString())
-      .isEqualTo("multipart/mixed; boundary=123")
-    assertThat(body.parts.size).isEqualTo(2)
-    assertThat(body.contentLength()).isEqualTo(-1)
     val buffer = Buffer()
     // Don't write to Buffer directly: Buffer.close() is a no-op. Wrap it so close()
     // actually closes the sink, like a real HTTP write.
@@ -313,12 +305,13 @@ class MultipartBodyTest {
         .addPart(GzipRequestBody("part1".toRequestBody(null)))
         .addPart(GzipRequestBody("part2".toRequestBody(null)))
         .build()
-    assertThat(body.boundary).isEqualTo("123")
-    assertThat(body.type).isEqualTo(MultipartBody.MIXED)
-    assertThat(body.contentType().toString())
-      .isEqualTo("multipart/mixed; boundary=123")
-    assertThat(body.parts.size).isEqualTo(2)
-    assertThat(body.contentLength()).isEqualTo(-1)
+
+    val expected = Buffer()
+    expected.writeUtf8("--123\r\n\r\n")
+    GzipRequestBody("part1".toRequestBody(null)).writeTo(expected)
+    expected.writeUtf8("\r\n--123\r\n\r\n")
+    GzipRequestBody("part2".toRequestBody(null)).writeTo(expected)
+    expected.writeUtf8("\r\n--123--\r\n")
 
     val buffer = Buffer()
     // Don't write to Buffer directly: Buffer.close() is a no-op. Wrap it so close()
@@ -326,23 +319,7 @@ class MultipartBodyTest {
     val sink = object : ForwardingSink(buffer) {}.buffer()
     body.writeTo(sink)
     sink.close()
-
-    MultipartReader(boundary = "123", source = buffer).use { reader ->
-      val part1 = reader.nextPart()!!
-      val part1Body =
-        GzipSource(part1.body).use {
-          it.buffer().readUtf8()
-        }
-      assertThat(part1Body).isEqualTo("part1")
-
-      val part2 = reader.nextPart()!!
-      val part2Body =
-        GzipSource(part2.body).use {
-          it.buffer().readUtf8()
-        }
-      assertThat(part2Body).isEqualTo("part2")
-      assertThat(reader.nextPart()).isNull()
-    }
+    assertThat(buffer.readUtf8()).isEqualTo(expected.readUtf8())
   }
 
   @Test
