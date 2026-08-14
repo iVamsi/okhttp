@@ -34,7 +34,7 @@ val copyKotlinTemplates =
   }
 
 // Build & use okhttp3/internal/idn/IdnaMappingTableInstance.kt
-val generateIdnaMappingTableConfiguration: Configuration by configurations.creating
+val generateIdnaMappingTableConfiguration = configurations.create("generateIdnaMappingTableConfiguration")
 dependencies {
   generateIdnaMappingTableConfiguration(projects.okhttpIdnaMappingTable)
 }
@@ -117,6 +117,7 @@ kotlin {
     androidMain {
       dependsOn(commonJvmAndroid)
       dependencies {
+        compileOnly(project.dependencies.platform(libs.bouncycastle.bom))
         compileOnly(libs.bouncycastle.bcprov)
         compileOnly(libs.bouncycastle.bcutil)
         compileOnly(libs.bouncycastle.bctls)
@@ -132,6 +133,7 @@ kotlin {
       dependencies {
         // These compileOnly dependencies must also be listed in applyOsgiMultiplatform() below.
         compileOnly(libs.conscrypt.openjdk)
+        compileOnly(project.dependencies.platform(libs.bouncycastle.bom))
         compileOnly(libs.bouncycastle.bcprov)
         compileOnly(libs.bouncycastle.bcutil)
         compileOnly(libs.bouncycastle.bctls)
@@ -142,7 +144,7 @@ kotlin {
       }
     }
 
-    val jvmTest by getting {
+    jvmTest {
       dependencies {
         implementation(libs.assertk)
         implementation(libs.conscrypt.openjdk)
@@ -185,7 +187,7 @@ kotlin {
     }
 
     if (testJavaVersion >= 17) {
-      val androidHostTest by getting {
+      named("androidHostTest") {
         dependencies {
           implementation(libs.androidx.junit)
           implementation(libs.assertk)
@@ -236,9 +238,9 @@ project.applyOsgiMultiplatform(
   "Bundle-SymbolicName: com.squareup.okhttp3",
 )
 
-val androidSignature by configurations.getting
-val jvmSignature by configurations.getting
-val checkstyleConfig by configurations.getting
+val androidSignature = configurations.getByName("androidSignature")
+val jvmSignature = configurations.getByName("jvmSignature")
+val checkstyleConfig = configurations.getByName("checkstyleConfig")
 
 // Animal Sniffer confirms we generally don't use APIs not on Java 8.
 configure<AnimalSnifferExtension> {
